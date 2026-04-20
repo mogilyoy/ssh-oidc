@@ -1,6 +1,9 @@
 package api
 
-import "crypto/ed25519"
+import (
+	"crypto/ed25519"
+	"os"
+)
 
 type User struct {
 	Username      string   `json:"Username"`
@@ -74,8 +77,12 @@ func NewServer() *Server {
 	for _, g := range DefaultGroups {
 		groups[g.Name] = g
 	}
+	issuer := "http://127.0.0.1:8080"
+	if env := os.Getenv("QWE_ISSUER"); env != "" {
+		issuer = env
+	}
 	return &Server{
-		issuer:  "http://127.0.0.1:8080",
+		issuer:  issuer,
 		users:   users,
 		groups:  groups,
 		privKey: priv,
