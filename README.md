@@ -1,14 +1,24 @@
 # opkssh-oidc
 
-SSH-доступ к серверам через OIDC-аутентификацию с использованием короткоживущих SSH-сертификатов.
+SSH-доступ к серверам через OIDC-аутентификацию с использованием PK Token (OpenPubKey) и короткоживущих SSH-сертификатов.
 
-## Как это работает
+## Как это работает (PK Token)
 
-1. Клиент запрашивает OIDC-токен у API-сервера (`qwe serve`).
-2. Генерирует SSH-ключ и сертификат с вшитым ID-токеном.
-3. Подключается к серверу по SSH с этим сертификатом.
-4. На сервере `AuthorizedKeysCommand` проверяет CA-подпись и верифицирует OIDC-токен.
-5. NSS-модуль резолвит пользователя (UID/GID/home) через API.
+Доверие строится не на общем CA-ключе, а на OIDC-провайдере. SSH-ключ криптографически привязан к OIDC-токену через `nonce`.
+
+1. Клиент генерирует SSH-ключ.
+2. Вычисляет `nonce = base64url(SHA256(ssh_public_key))`.
+3. Запрашивает OIDC-токен с этим nonce — токен доказывает, что ключ принадлежит пользователю.
+4. Создаёт self-signed SSH-сертификат (свой ключ = CA), встраивает OIDC-токен в `KeyId`.
+5. Подключается к серверу по SSH.
+6. На сервере `AuthorizedKeysCommand`:
+   - Парсит сертификат, извлекает OIDC-токен из `KeyId`.
+   - Проверяет подпись токена через JWKS.
+   - Проверяет, что `nonce` в токене совпадает с `SHA256(публичный ключ сертификата)`.
+   - Если всё верно — выдаёт `cert-authority <signing_key>`, sshd проверяет подпись сертификата.
+7. NSS-модуль резолвит пользователя (UID/GID/home) через API.
+
+**Результат**: никакого общего CA, никакого копирования ключей. Доверие полностью через OIDC.
 
 ---
 
@@ -40,13 +50,17 @@ make
 ```
 
 Это автоматически:
-- получит OIDC-токен от сервера;
 - сгенерирует SSH-ключ (если нет);
-- создаст CA (если нет);
-- выпустит SSH-сертификат (15 мин TTL) с вшитым токеном;
+- вычислит nonce из публичного ключа;
+- получит OIDC-токен с привязкой к ключу;
+- выпустит self-signed SSH-сертификат (15 мин TTL) с вшитым токеном;
 - подключится по SSH.
 
-Ключи и сертификаты сохраняются в `~/.qwe/`.
+Ключи и сертификаты сохраняются в `~/.qwe/`:
+- `alice` — приватный ключ
+- `alice.pub` — публичный ключ
+- `alice-cert.pub` — SSH-сертификат
+- `token.json` — кэш OIDC-токена
 
 ### Доступные пользователи (тестовые)
 
@@ -148,25 +162,12 @@ systemctl enable --now qwe
 
 Проверить: `curl http://127.0.0.1:8080/`
 
-### 6. Подготовить директорию для CA
-
-```bash
-mkdir -p /etc/qwe
-```
-
-CA-ключ будет скопирован автоматически при первом подключении клиента (вручную):
-
-```bash
-# С клиента после первого ./qwe ssh --cert-only:
-scp ~/.qwe/ca.pub root@<server-ip>:/etc/qwe/ca.pub
-```
-
-### 7. Настроить sshd
+### 6. Настроить sshd
 
 Добавить в `/etc/ssh/sshd_config`:
 
 ```
-AuthorizedKeysCommand /usr/local/bin/qwe --data-dir /etc/qwe --api-url http://<server-ip>:8080 auth-keys %u %k %t
+AuthorizedKeysCommand /usr/local/bin/qwe --api-url http://<server-ip>:8080 auth-keys %u %k %t
 AuthorizedKeysCommandUser nobody
 ```
 
@@ -174,7 +175,9 @@ AuthorizedKeysCommandUser nobody
 systemctl restart ssh
 ```
 
-### 8. Создать home-директории (опционально)
+> **Примечание**: В отличие от классической схемы с CA, серверу не нужны никакие ключевые файлы. Достаточно бинарника `qwe` и доступа к API.
+
+### 7. Создать home-директории (опционально)
 
 ```bash
 mkdir -p /home/alice /home/bob
@@ -202,7 +205,7 @@ curl http://127.0.0.1:8080/users?username=alice
 getent passwd alice
 
 # auth-keys вручную (подставить base64 из сертификата)
-sudo -u nobody /usr/local/bin/qwe --data-dir /etc/qwe --api-url http://<server-ip>:8080 auth-keys alice <base64> ssh-ed25519-cert-v01@openssh.com
+sudo -u nobody /usr/local/bin/qwe --api-url http://<server-ip>:8080 auth-keys alice <base64> ssh-ed25519-cert-v01@openssh.com
 
 # Логи sshd
 journalctl -u ssh -f
@@ -214,7 +217,7 @@ journalctl -u ssh -f
 # Проверить сертификат
 ssh-keygen -L -f ~/.qwe/alice-cert.pub
 
-# Верифицировать токен
+# Верифицировать токен и nonce-привязку
 ./qwe verify ~/.qwe/alice-cert.pub --api-url http://<server-ip>:8080
 
 # Подключиться с debug
@@ -230,19 +233,23 @@ ssh -vvv -i ~/.qwe/alice -o CertificateFile=~/.qwe/alice-cert.pub alice@<server-
 ──────                          ──────
 qwe ssh <ip> --user alice
   │
-  ├─ POST /token ──────────────► qwe serve (OIDC API :8080)
-  │◄── id_token ◄──────────────┤
+  ├─ ssh-keygen (user key)       │
+  ├─ nonce = SHA256(pubkey)      │
   │                              │
-  ├─ ssh-keygen (CA + user key) │
-  ├─ sign cert (KeyId=user|jwt) │
+  ├─ POST /token {nonce} ──────► qwe serve (OIDC API :8080)
+  │◄── id_token (nonce bound) ◄─┤
+  │                              │
+  ├─ self-sign cert              │
+  │   (KeyId = user|jwt)         │
   │                              │
   ├─ SSH connect ──────────────► sshd
   │                              │ ├─ AuthorizedKeysCommand
   │                              │ │   └─ qwe auth-keys %u %k %t
   │                              │ │       ├─ parse cert from %k
-  │                              │ │       ├─ verify CA signature
-  │                              │ │       ├─ extract & verify OIDC token
-  │                              │ │       └─ output: cert-authority <ca.pub>
+  │                              │ │       ├─ extract OIDC token from KeyId
+  │                              │ │       ├─ verify token via JWKS
+  │                              │ │       ├─ verify nonce == SHA256(cert key)
+  │                              │ │       └─ output: cert-authority <signing_key>
   │                              │ ├─ sshd verifies cert signature
   │                              │ └─ NSS (libnss_oslogin.so)
   │                              │       └─ GET /users?username=alice
@@ -255,6 +262,6 @@ qwe ssh <ip> --user alice
 cmd/qwe/main.go          CLI: serve, login, ssh, verify, auth-keys
 internal/api/             OIDC API сервер (тестовые пользователи, /token, /jwks, /users, /groups)
 internal/oidc/            JWT-токены: выпуск (EdDSA) и верификация через JWKS
-internal/ssh/             SSH CA, генерация ключей, создание и проверка сертификатов
+internal/ssh/             SSH-ключи, self-signed сертификаты, PK Token верификация
 nss/                      NSS-модуль (C++) для резолва пользователей через API
 ```

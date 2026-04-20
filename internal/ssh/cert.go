@@ -1,8 +1,9 @@
 package sshcert
 
 import (
-	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -21,18 +22,7 @@ type VerifyResult struct {
 	Sudo     bool
 }
 
-func EnsureCA(caPath string) error {
-	if _, err := os.Stat(caPath); err == nil {
-		return nil
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-f", caPath, "-N", "", "-q")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
+// EnsureUserKeyPair generates an ed25519 SSH keypair if it doesn't exist.
 func EnsureUserKeyPair(username, privPath string) error {
 	if _, err := os.Stat(privPath); err == nil {
 		return nil
@@ -45,27 +35,35 @@ func EnsureUserKeyPair(username, privPath string) error {
 	return cmd.Run()
 }
 
-func CreateCertificate(username, idToken, pubKeyPath, certPath, caKeyPath string) error {
-	pubBytes, err := os.ReadFile(pubKeyPath)
+// ComputeNonce computes base64url(SHA256(pubkey_bytes)) for PK Token binding.
+func ComputeNonce(pubKeyPath string) (string, error) {
+	data, err := os.ReadFile(pubKeyPath)
 	if err != nil {
-		return err
+		return "", err
 	}
-	pubKey, _, _, _, err := ssh.ParseAuthorizedKey(pubBytes)
+	pubKey, _, _, _, err := ssh.ParseAuthorizedKey(data)
 	if err != nil {
-		return err
+		return "", err
 	}
+	hash := sha256.Sum256(pubKey.Marshal())
+	return base64.RawURLEncoding.EncodeToString(hash[:]), nil
+}
 
-	caBytes, err := os.ReadFile(caKeyPath)
+// CreateSelfSignedCert creates an SSH certificate signed by the user's own key (PK Token style).
+// The OIDC token is embedded in KeyId as "username|jwt".
+// No separate CA — the user's private key acts as its own CA.
+func CreateSelfSignedCert(username, idToken, privKeyPath, certPath string) error {
+	privBytes, err := os.ReadFile(privKeyPath)
 	if err != nil {
 		return err
 	}
-	signer, err := ssh.ParsePrivateKey(caBytes)
+	signer, err := ssh.ParsePrivateKey(privBytes)
 	if err != nil {
 		return err
 	}
 
 	cert := &ssh.Certificate{
-		Key:             pubKey,
+		Key:             signer.PublicKey(),
 		Serial:          1,
 		CertType:        ssh.UserCert,
 		KeyId:           username + "|" + idToken,
@@ -87,77 +85,43 @@ func CreateCertificate(username, idToken, pubKeyPath, certPath, caKeyPath string
 	}
 
 	data := ssh.MarshalAuthorizedKey(cert)
-	if err := os.WriteFile(certPath, data, 0o644); err != nil {
-		return err
-	}
-	return nil
+	return os.WriteFile(certPath, data, 0o644)
 }
 
-func VerifyCertificate(certPath, caPubPath, apiURL string) (*VerifyResult, error) {
-	data, err := os.ReadFile(certPath)
-	if err != nil {
-		return nil, err
-	}
-	pubKey, _, _, _, err := ssh.ParseAuthorizedKey(data)
-	if err != nil {
-		return nil, err
-	}
-	cert, ok := pubKey.(*ssh.Certificate)
-	if !ok {
-		return nil, errors.New("certificate file does not contain an SSH certificate")
-	}
-	caData, err := os.ReadFile(caPubPath)
-	if err != nil {
-		return nil, err
-	}
-	caKey, _, _, _, err := ssh.ParseAuthorizedKey(caData)
-	if err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(cert.SignatureKey.Marshal(), caKey.Marshal()) {
-		return nil, errors.New("certificate signature key does not match CA public key")
-	}
-	checker := &ssh.CertChecker{
-		IsUserAuthority: func(auth ssh.PublicKey) bool {
-			return bytes.Equal(auth.Marshal(), caKey.Marshal())
-		},
-	}
-	// Extract username from KeyId (format: "username|jwt")
-	principal := cert.KeyId
-	if parts := strings.SplitN(cert.KeyId, "|", 2); len(parts) == 2 {
-		principal = parts[0]
-	}
-	if err := checker.CheckCert(principal, cert); err != nil {
-		return nil, fmt.Errorf("certificate validation failed: %w", err)
-	}
-	if time.Now().Unix() < int64(cert.ValidAfter) || time.Now().Unix() > int64(cert.ValidBefore) {
-		return nil, errors.New("certificate is not currently valid")
-	}
+// VerifyPKToken verifies a PK Token: checks OIDC token signature and nonce binding.
+// Returns VerifyResult if the token is valid and bound to the cert's key.
+func VerifyPKToken(cert *ssh.Certificate, apiURL string) (*VerifyResult, error) {
+	// Extract OIDC token from KeyId
 	parts := strings.SplitN(cert.KeyId, "|", 2)
 	if len(parts) != 2 {
-		return nil, errors.New("OIDC token not found in certificate KeyId")
+		return nil, errors.New("no OIDC token in certificate KeyId")
 	}
 	idToken := parts[1]
+
+	// Verify OIDC token signature via JWKS
 	claims, err := oidc.ParseAndVerifyIDToken(apiURL, idToken)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("OIDC token verification failed: %w", err)
 	}
-	result := &VerifyResult{Username: claims.Subject, Groups: claims.Groups, Sudo: hasSudo(claims.Groups)}
-	return result, nil
-}
 
-func hasSudo(groups []string) bool {
-	for _, g := range groups {
-		if strings.Contains(g, "admin") || strings.Contains(g, "sudo") {
-			return true
-		}
+	// Verify nonce binding: nonce must equal base64url(SHA256(cert public key))
+	hash := sha256.Sum256(cert.Key.Marshal())
+	expectedNonce := base64.RawURLEncoding.EncodeToString(hash[:])
+	if claims.Nonce != expectedNonce {
+		return nil, fmt.Errorf("nonce mismatch: token nonce does not match certificate public key")
 	}
-	return false
-}
 
-// HasSudo checks if any group implies sudo access (exported for use in auth-keys).
-func HasSudo(groups []string) bool {
-	return hasSudo(groups)
+	// Check cert time validity
+	now := time.Now().Unix()
+	if now < int64(cert.ValidAfter) || now > int64(cert.ValidBefore) {
+		return nil, errors.New("certificate is expired or not yet valid")
+	}
+
+	return &VerifyResult{
+		Username: claims.Subject,
+		Groups:   claims.Groups,
+		Sudo:     HasSudo(claims.Groups),
+	}, nil
 }
 
 // ParseAuthorizedKey wraps ssh.ParseAuthorizedKey.
@@ -171,23 +135,17 @@ func AsCertificate(key ssh.PublicKey) (*ssh.Certificate, bool) {
 	return cert, ok
 }
 
-// VerifyCertCA checks that the certificate was signed by the CA in caPubPath.
-func VerifyCertCA(cert *ssh.Certificate, caPubPath string) error {
-	caData, err := os.ReadFile(caPubPath)
-	if err != nil {
-		return fmt.Errorf("failed to read CA public key: %w", err)
+// MarshalPublicKey formats a public key as an authorized_keys line.
+func MarshalPublicKey(key ssh.PublicKey) string {
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+}
+
+// HasSudo checks if any group implies sudo access.
+func HasSudo(groups []string) bool {
+	for _, g := range groups {
+		if strings.Contains(g, "admin") || strings.Contains(g, "sudo") {
+			return true
+		}
 	}
-	caKey, _, _, _, err := ssh.ParseAuthorizedKey(caData)
-	if err != nil {
-		return fmt.Errorf("failed to parse CA public key: %w", err)
-	}
-	if !bytes.Equal(cert.SignatureKey.Marshal(), caKey.Marshal()) {
-		return errors.New("certificate was not signed by the expected CA")
-	}
-	// Check time validity
-	now := time.Now().Unix()
-	if now < int64(cert.ValidAfter) || now > int64(cert.ValidBefore) {
-		return errors.New("certificate is not currently valid (expired or not yet valid)")
-	}
-	return nil
+	return false
 }

@@ -14,7 +14,6 @@ type User struct {
 	HomeDirectory string   `json:"HomeDirectory"`
 	Shell         string   `json:"Shell"`
 	Groups        []string `json:"Groups"`
-	SSHKeys       []string `json:"SSHKeys"`
 }
 
 type Group struct {
@@ -43,7 +42,6 @@ var DefaultUsers = []User{
 		HomeDirectory: "/home/alice",
 		Shell:         "/bin/bash",
 		Groups:        []string{"cluster-1:admin", "cluster-1:dev"},
-		SSHKeys:       []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEzBmFRYe3aWcRKNK1f0Gjv9ug9FiwUbh9M9Ig6G0pcP alice@example.com"},
 	},
 	{
 		Username:      "bob",
@@ -54,7 +52,6 @@ var DefaultUsers = []User{
 		HomeDirectory: "/home/bob",
 		Shell:         "/bin/bash",
 		Groups:        []string{"cluster-1:view"},
-		SSHKeys:       []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICM5N6gGZb0EgN9Jdhf7FJp2R2IhQguyyN2XCI+ud1X bob@example.com"},
 	},
 }
 

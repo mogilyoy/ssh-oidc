@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/mastervolkov/opkssh-oidc/internal/api"
-	"github.com/mastervolkov/opkssh-oidc/internal/oidc"
 	ss "github.com/mastervolkov/opkssh-oidc/internal/ssh"
 	"github.com/spf13/cobra"
 )
@@ -78,8 +77,8 @@ func readJSON(path string, v any) error {
 	return json.Unmarshal(data, v)
 }
 
-func requestToken(ctx context.Context, apiURL, username string) (*storedToken, error) {
-	reqBody := map[string]string{"username": username}
+func requestToken(ctx context.Context, apiURL, username, nonce string) (*storedToken, error) {
+	reqBody := map[string]string{"username": username, "nonce": nonce}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
@@ -157,15 +156,28 @@ func loginCmd() *cobra.Command {
 				return errors.New("--user is required")
 			}
 			ctx := cmd.Context()
-			token, err := requestToken(ctx, apiURL, username)
-			if err != nil {
-				return err
-			}
 			dd, err := resolveDataDir()
 			if err != nil {
 				return err
 			}
 			if err := os.MkdirAll(dd, 0o700); err != nil {
+				return err
+			}
+
+			// Generate keypair first so we can compute nonce
+			keyBase := filepath.Join(dd, username)
+			privKey := keyBase
+			pubKey := keyBase + ".pub"
+			if err := ss.EnsureUserKeyPair(username, privKey); err != nil {
+				return err
+			}
+			nonce, err := ss.ComputeNonce(pubKey)
+			if err != nil {
+				return err
+			}
+
+			token, err := requestToken(ctx, apiURL, username, nonce)
+			if err != nil {
 				return err
 			}
 			path := filepath.Join(dd, "token.json")
@@ -207,11 +219,26 @@ func sshCmd() *cobra.Command {
 				return err
 			}
 
+			keyBase := filepath.Join(dd, username)
+			privKey := keyBase
+			pubKey := keyBase + ".pub"
+			certPath := keyBase + "-cert.pub"
+
+			if err := ss.EnsureUserKeyPair(username, privKey); err != nil {
+				return err
+			}
+
+			// Compute nonce = base64url(SHA256(pubkey)) for PK Token binding
+			nonce, err := ss.ComputeNonce(pubKey)
+			if err != nil {
+				return err
+			}
+
 			tokenPath := filepath.Join(dd, "token.json")
 			token, err := loadSavedToken(tokenPath)
 			if err != nil || time.Now().After(token.Expiry) || token.Username != username {
 				fmt.Fprintf(cmd.OutOrStdout(), "token missing or expired, requesting a new one\n")
-				token, err = requestToken(cmd.Context(), apiURL, username)
+				token, err = requestToken(cmd.Context(), apiURL, username, nonce)
 				if err != nil {
 					return err
 				}
@@ -220,19 +247,7 @@ func sshCmd() *cobra.Command {
 				}
 			}
 
-			keyBase := filepath.Join(dd, username)
-			privKey := keyBase
-			pubKey := keyBase + ".pub"
-			certPath := keyBase + "-cert.pub"
-			caKey := filepath.Join(dd, "ca")
-
-			if err := ss.EnsureCA(caKey); err != nil {
-				return err
-			}
-			if err := ss.EnsureUserKeyPair(username, privKey); err != nil {
-				return err
-			}
-			if err := ss.CreateCertificate(username, token.IDToken, pubKey, certPath, caKey); err != nil {
+			if err := ss.CreateSelfSignedCert(username, token.IDToken, privKey, certPath); err != nil {
 				return err
 			}
 
@@ -269,13 +284,19 @@ func verifyCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			certPath := args[0]
-			caPub := filepath.Join(func() string {
-				if d, err := resolveDataDir(); err == nil {
-					return d
-				}
-				return ".qwe"
-			}(), "ca.pub")
-			result, err := ss.VerifyCertificate(certPath, caPub, apiURL)
+			certData, err := os.ReadFile(certPath)
+			if err != nil {
+				return err
+			}
+			pubKey, _, _, _, err := ss.ParseAuthorizedKey(certData)
+			if err != nil {
+				return err
+			}
+			cert, ok := ss.AsCertificate(pubKey)
+			if !ok {
+				return errors.New("file does not contain an SSH certificate")
+			}
+			result, err := ss.VerifyPKToken(cert, apiURL)
 			if err != nil {
 				return err
 			}
@@ -305,7 +326,7 @@ func authKeysCmd() *cobra.Command {
 				return nil
 			}
 
-			// Parse the cert directly from base64 (avoid file round-trip)
+			// Parse the cert directly from base64
 			fullKey := keyType + " " + keyStr
 			pubKey, _, _, _, err := ss.ParseAuthorizedKey([]byte(fullKey))
 			if err != nil {
@@ -318,56 +339,23 @@ func authKeysCmd() *cobra.Command {
 				return nil
 			}
 
-			// Verify CA signature
-			caPubPath := filepath.Join(func() string {
-				if d, err := resolveDataDir(); err == nil {
-					return d
-				}
-				return ".qwe"
-			}(), "ca.pub")
-
-			if err := ss.VerifyCertCA(cert, caPubPath); err != nil {
-				fmt.Fprintf(os.Stderr, "auth-keys: CA verification failed: %v\n", err)
-				return nil
-			}
-
-			// Extract OIDC token from KeyId (format: "username|jwt")
-			parts := strings.SplitN(cert.KeyId, "|", 2)
-			if len(parts) != 2 {
-				fmt.Fprintf(os.Stderr, "auth-keys: no OIDC token in KeyId\n")
-				return nil
-			}
-			certUser := parts[0]
-			idToken := parts[1]
-
-			if certUser != username {
-				fmt.Fprintf(os.Stderr, "auth-keys: username mismatch: cert=%s sshd=%s\n", certUser, username)
-				return nil
-			}
-
-			// Verify OIDC token
-			claims, err := oidc.ParseAndVerifyIDToken(apiURL, idToken)
+			// Verify PK Token: OIDC signature + nonce binding
+			result, err := ss.VerifyPKToken(cert, apiURL)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "auth-keys: OIDC token verification failed: %v\n", err)
+				fmt.Fprintf(os.Stderr, "auth-keys: PK Token verification failed: %v\n", err)
 				return nil
 			}
 
-			if claims.Subject != username {
-				fmt.Fprintf(os.Stderr, "auth-keys: token subject mismatch: %s != %s\n", claims.Subject, username)
+			if result.Username != username {
+				fmt.Fprintf(os.Stderr, "auth-keys: username mismatch: token=%s sshd=%s\n", result.Username, username)
 				return nil
 			}
 
 			fmt.Fprintf(os.Stderr, "auth-keys: authorized %s (groups: %s, sudo: %v)\n",
-				username, strings.Join(claims.Groups, ", "), ss.HasSudo(claims.Groups))
+				username, strings.Join(result.Groups, ", "), result.Sudo)
 
-			// Output cert-authority line with CA public key — sshd will verify the cert signature itself
-			caPubData, err := os.ReadFile(caPubPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "auth-keys: failed to read CA pub: %v\n", err)
-				return nil
-			}
-			fmt.Printf("cert-authority %s", strings.TrimSpace(string(caPubData)))
-			fmt.Println()
+			// Output cert-authority with the self-signed CA key (cert's own signing key)
+			fmt.Printf("cert-authority %s\n", ss.MarshalPublicKey(cert.SignatureKey))
 			return nil
 		},
 	}
