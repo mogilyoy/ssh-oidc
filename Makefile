@@ -1,19 +1,26 @@
+GO = go
 CC = g++
 CFLAGS = -std=c++11 -Wall -Wextra -Iinclude -I/usr/local/include
 LDFLAGS = -lcurl
 
-TARGET = libnss_oslogin.so
+NSS_TARGET = libnss_oslogin.so
+NSS_SRCS = ncc/ncc_oslogin.cc ncc/oslogin_utils.cc
+NSS_OBJS = $(NSS_SRCS:.cc=.o)
 
-SRCS = ncc/ncc_oslogin.cc ncc/oslogin_utils.cc
-OBJS = $(SRCS:.cc=.o)
+.PHONY: all qwe nss clean
 
-all: $(TARGET)
+all: qwe
 
-$(TARGET): $(OBJS)
+qwe:
+	$(GO) build -o qwe ./cmd/qwe
+
+nss: $(NSS_TARGET)
+
+$(NSS_TARGET): $(NSS_OBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
 
 %.o: %.cc
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f qwe $(NSS_OBJS) $(NSS_TARGET)
